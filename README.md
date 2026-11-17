@@ -90,6 +90,48 @@ config + trigger there. The stock 5-minute logrotate job then runs our
 USB payload as root, which restores the UID-0 passwd, SSH, and the UI
 patch. Live `/etc/passwd` is a tmpfs file; flash is never written.
 
+## OpenWrt: what you'd gain, what you'd lose
+
+This project keeps the **stock firmware** and re-enables what the ISP build
+hides. The alternative is replacing it with OpenWrt. Both are valid; they
+trade different things.
+
+**Why OpenWrt is attractive here**
+
+- True package management (`opkg`), current kernel, upstream WiFi drivers.
+- No ISP customisation flags, no CWMP/TR-069 unless you install it.
+- Full root by design — no per-boot restore dance.
+- The box is already OpenWrt-derived internally (kernel built with OpenWrt
+  GCC 4.8.1, OpenWrt-style init/crontab), so porting is plausible.
+
+**Why it's not a drop-in swap on this unit**
+
+- **VoIP would be lost.** The stock FXS stack (`icf.exe`, `mm.exe`,
+  `voiceApp`) is Zyxel-proprietary; there's no upstream OpenWrt support for
+  two FXS ports on EcoNet silicon. Your phone ports go dead.
+- **DSL support** — no upstream driver for this EcoNet VDSL/ADSL PHY. On
+  this ETH-WAN variant the jack isn't even populated, but other ABVY units
+  would lose xDSL entirely.
+- **MT7915D WiFi** is supported upstream in principle, but the DBDC /
+  Econet-specific calibration data on this board may need work.
+- **Dual-boot A/B slots and the ZHAL bootloader** aren't understood well
+  enough to promise a safe in-place install; a bad flash here is a hardware
+  recovery job (SPI NAND programmer / ZHAL `ATUR` over UART).
+- **Signed firmware.** Stock `.bin` images end in a 64-byte signature, so
+  modified Zyxel images can't be flashed through the normal web upgrade —
+  which is exactly why this project stays in RAM instead.
+
+**Practical recommendation**
+
+- Keep stock + this tool if you want **VoIP, xDSL compatibility, and the
+  ISP's line provisioning**.
+- Consider OpenWrt only if this unit will be a **pure router/AP with no
+  phone or DSL requirement**, and only after a full flash backup (all 14
+  partitions) plus a proven UART recovery path.
+- The two can coexist in spirit: use this tool to grab full flash backups
+  and explore the hardware *before* deciding, since those backups are also
+  what make an OpenWrt attempt recoverable.
+
 ## Safety notes
 
 - **Ownership first.** Check whether you or your ISP owns the device before
