@@ -659,6 +659,7 @@ def cmd_persist(args):
     print('[*] planned persistent changes:')
     print(f'    root shadow: single SHA-512 hash, lastchange={lastchg}')
     print('    SSH service: Enable=true Mode=LAN_ONLY RestartDeamon=true password-auth=true')
+    print('[*] note: this persists root only; the UI unhide is a per-boot bind-mount.')
     if args.dry_run:
         print('[*] dry run: nothing written.')
         return 0

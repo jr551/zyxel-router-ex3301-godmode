@@ -15,7 +15,9 @@ root that survives reboots without a USB stick or a Deck-side watcher**.
   pages exist in the build (Remote Management with FTP/TELNET/SSH rows, xDSL
   Statistics, SIP/Phone/Call Rule, Broadband, Multicast, Time, SNMP, Firmware
   Upgrade, …). 12 entries whose routes are compiled out of this ISP build are
-  deliberately omitted so every visible menu item works.
+  deliberately omitted so every visible menu item works. The UI patch is a
+  per-boot tmpfs/bind-mount operation; `persist` does not make it permanent
+  (see “What persists and what doesn't”).
 - **Persist (config-only):** `persist` writes a clean root shadow and a
   LAN-only SSH binding into `/data/zcfg_config.json`. Stock dropbear starts
   at boot, so root SSH comes back with **no USB stick, no logrotate hook and
@@ -107,45 +109,165 @@ the one-time admin UID 0 shell or an existing root password. Useful flags:
 ./zyxel-godmode.py --root-password-file ~/.zyxel-root persist --rotate-root-password
 ```
 
-## What persists, exactly
+## Entry: the one-time root vector
 
-`persist` writes **only** `/data/zcfg_config.json`, the router's user-data
-configuration file. It makes two changes:
+This is how the first privileged shell is obtained. It is **not** the
+persistence mechanism.
 
-1. The `root` account's `shadow` value becomes a clean single-hash line:
-   `root:$6$...:<lastchange>:0:99999:7:::`. The stock line contained a
-   duplicated hash, which made root password auth fail.
-2. The `X_ZYXEL_RemoteManagement` SSH service is set to
-   `Enable=true`, `Mode="LAN_ONLY"`, `OldMode="LAN_ONLY"`,
-   `RestartDeamon=true`, `DisableSshPasswordLogin=false`.
+1. **Authenticated handler.** The web UI exposes
+   `/cgi-bin/TR369Certificates?action=download&name=...&sessionkey=...`.
+   The handler builds a `cp` command from the 128-byte `name` field into a
+   `/data/usp/cert/...` source and a temp destination. A name padded with
+   spaces is interpreted as `cp <src> <dst>`; the trailing temp path is
+   truncated by the 128-byte buffer. The command runs as root because the
+   web/TR-369 service does.
+2. **What we copy.** `extract` copies live `/etc/passwd` to the USB root.
+   `stage` builds `payload/` on the USB with a prepared passwd (admin UID 0,
+   `/bin/sh`), `boot.sh`, a logrotate hook, a trigger file, and the patched
+   `index.html`/`app.js`.
+3. **Hook install.** `restore` logs in as admin and uses the same handler to
+   copy:
+   - `payload/sys_logrotate.conf` to `/var/logrotate.d/`
+   - `payload/root_trigger.log` to `/tmp/`
 
-At boot, `zcmd` generates `/etc/shadow` from that config line and stock
-`dropbear -p 22 -P /var/run/dropbear.pid` starts from the remote-management
-config. No hook, watcher, or USB stick is involved. The firmware, bootloader,
-and NVRAM are not modified.
+   Both are tmpfs paths.
+4. **Stock logrotate executes it.** The stock cron runs logrotate every five
+   minutes. The hook's `postrotate` section loops over `/mnt/usb*` and runs
+   `/bin/sh "$d/payload/boot.sh"` as root.
+5. **What `boot.sh` does.** It finds the USB volume with `payload/passwd`,
+   copies the prepared passwd over `/etc/passwd` (admin becomes
+   `0:0:/bin/sh`), starts `dropbear -p 192.168.1.1:22`, adds a LAN-only
+   `iptables` ACCEPT for SSH, and bind-mounts the patched `/web` tree over
+   `/web` so the hidden pages render. It writes `/tmp/root_boot.log`.
+6. **Result.** `ssh admin@192.168.1.1` is UID 0 and the full UI is served.
+
+Why this is not persistence: `/etc/passwd`, `/var/logrotate.d`, `/tmp`,
+and the `/web` bind mount are all tmpfs. A power cycle removes every one.
+The USB stick by itself is inert: nothing executes `payload/boot.sh` until
+the tmpfs logrotate hook is re-installed. The old Deck watcher did exactly
+that re-installation every boot; it is a third-party caller, not on-router
+persistence, and is deprecated.
+
+## Persistence: what `persist` changes
+
+`persist` uses the one-time privileged shell (admin UID 0, or an existing
+root login) to edit `/data/zcfg_config.json`, the router's persistent
+user-data config on the yaffs2 `/data` partition. It makes two changes:
+
+1. **Root shadow.** The `root` account's `shadow` value is replaced with a
+   clean single-hash line:
+   `root:$6$<hash>:<lastchange>:0:99999:7:::`. The hash is generated with
+   `openssl passwd -6`; the plaintext root password never goes into the
+   config. The stock line had a duplicated hash, which made root password
+   auth fail.
+2. **SSH service.** The `X_ZYXEL_RemoteManagement` service named `SSH` is
+   set to `Enable=true`, `Port=22`, `Mode="LAN_ONLY"`,
+   `OldMode="LAN_ONLY"`, `RestartDeamon=true`,
+   `DisableSshPasswordLogin=false`.
+
+Then `persist` writes the config, reboots, and waits for root SSH. The boot
+chain that makes it persistent:
+
+```text
+SPI NAND bootloader
+  -> kernel + squashfs rootfs (read-only)
+  -> /data yaffs2 (mtd9, read-write)
+  -> rcS / zcmd loads /data/zcfg_config.json
+  -> zcmd generates /tmp/var/passwd and /tmp/var/shadow
+     (/etc/passwd and /etc/shadow are symlinks to those tmpfs files)
+  -> libzcfg_be remote-management starts
+     dropbear -p 22 -P /var/run/dropbear.pid
+  -> dropbear authenticates root against /etc/shadow
+  -> uid=0 root shell, every boot, no USB and no Deck
+```
+
+The root account is stock `root:x:0:0:root:/home/root:/bin/sh`; its shell
+is already `/bin/sh`. `persist` only gives it a known password and makes
+stock dropbear start at boot. The admin account returns to its stock
+`admin:x:21:21:admin:/home/admin:/usr/bin/zysh`; use **root** after
+`persist`, not admin.
+
+## What persists and what doesn't
+
+**Survives a reboot (config-only):**
+
+- root SSH on port 22, LAN-only;
+- the root password hash in `/data/zcfg_config.json`;
+- the stock `dropbear` service start from remote-management config;
+- the stock `root` account (UID 0, `/bin/sh`).
+
+**Does not survive a clean reboot without the USB hook:**
+
+- the UI unhide (the `/web` bind-mount and patched `app.js`/`index.html`);
+- the temporary admin UID 0 / `/bin/sh` rewrite;
+- the hook's `iptables` rule and `/var/logrotate.d` hook;
+- `/tmp/root_boot.log`.
+
+This is the deliberate trade-off: the config-only method gives true
+on-router root persistence with no third-party caller, but the full UI
+patch remains a per-boot tmpfs/bind-mount operation. After a clean reboot
+without the hook, the web UI is stock (hidden pages), while root SSH still
+works. To re-apply the UI patch, run the one-time hook again or copy the
+patched files and bind-mount `/web` from a root shell:
+
+```sh
+MNT=$(for d in /mnt/usb*; do
+  [ -f "$d/payload/index_hidden.html" ] && echo "$d" && break
+done)
+cp -a /web /tmp/web
+cp "$MNT/payload/index_hidden.html" /tmp/web/index.html
+cp "$MNT/payload/app_patched.js" /tmp/web/static/js/app.js
+mount --bind /tmp/web /web
+```
+
+The hook does this automatically when it runs.
+
+## Verification after a full reboot
+
+The no-Deck test removed the logrotate hook and stopped the watcher, then
+rebooted. After boot:
+
+- `ssh root@192.168.1.1` -> `uid=0(root) gid=0(root)`
+- `/etc/passwd` -> `admin:x:21:21:admin:/home/admin:/usr/bin/zysh`
+  (stock admin; the hook did not run)
+- `/tmp/root_boot.log` -> absent
+- `/var/logrotate.d/sys_logrotate.conf` -> stock 60-byte logrotate file,
+  not the 173-byte payload hook
+- `ps` -> `dropbear -p 22 -P /var/run/dropbear.pid` (stock config start,
+  not the hook's `dropbear -p 192.168.1.1:22`)
+- `/etc/shadow` root line -> one `$6$` hash, no duplicate
+- `/data/zcfg_config.json` SSH service -> `Mode="LAN_ONLY"`
+
+## Backups and recovery
 
 `persist` saves the old config in three places:
 
-- `~/.zyxel-godmode/zcfg_config.<timestamp>.json` on this machine,
-- `/data/zcfg_config.pre_persist.bak` on the router (first run only),
+- `~/.zyxel-godmode/zcfg_config.<timestamp>.json` on this machine;
+- `/data/zcfg_config.pre_persist.bak` on the router (first run only);
 - `/mnt/usb*/zcfg_config.pre_persist.bak` if a USB volume is mounted.
 
-`depersist` copies the on-router backup back and reboots. A factory reset or
-firmware upgrade that wipes `/data` also removes persistent root.
+`depersist` copies the on-router backup back and reboots. If you are locked
+out after a bad write, the web UI may still be reachable; use the one-time
+USB hook/`restore` to get a privileged shell, then copy
+`/data/zcfg_config.pre_persist.bak` back to `/data/zcfg_config.json` and
+reboot. A factory reset or a firmware upgrade that wipes `/data` also
+removes persistent root.
 
-## One-time root: how it works (30 seconds)
+## Boundaries
 
-The `/cgi-bin/TR369Certificates?action=download` endpoint builds
-`cp /data/usp/cert/<name> <tmp>` with a 128-byte buffer. A padded `name`
-with spaces turns it into `cp <src> <dst>` with the temp destination
-truncated away — an authenticated arbitrary file copy. We use it only to
-copy router files onto the removable USB stick and to drop a logrotate
-config + trigger there. The stock 5-minute logrotate job then runs our
-USB payload as root, which restores the UID-0 passwd, SSH, and the UI
-patch. Live `/etc/passwd` is a tmpfs file; the one-time path writes no
-firmware or bootloader data.
+- This is a **config/root persistence** technique, not a bootloader or
+  firmware exploit. The signed firmware and A/B boot validation are not
+  bypassed.
+- `persist` writes only `/data/zcfg_config.json`; it does not write the
+  kernel, rootfs, bootloader, or NVRAM.
+- The root password is stored locally in `~/.zyxel-root` (0600) or the file
+  passed with `--root-password-file`; the admin web password is separate and
+  should be changed.
+- TR-069/ACS settings are not modified by this tool. If you do not need
+  remote management, disable it or firewall the ACS/connection-request
+  paths separately.
 
-The old Deck-side watcher (`watch` / `install`) is **not** part of the
+The old Deck-side watcher (`watch` / `install`) is not part of the
 persistence method. It is kept only as a legacy fallback for firmware where
 `persist` does not work; it is deprecated.
 
