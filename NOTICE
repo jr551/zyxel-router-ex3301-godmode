@@ -1,0 +1,36 @@
+# NOTICE
+
+This repository is an independent, non-commercial research and repair aid.
+It is **not affiliated with, endorsed by, sponsored by, or approved by**
+Zyxel Communications Corp., EcoNet, Hyperoptic, OpenWrt, or any internet
+service provider.
+
+## No redistributed proprietary material
+
+This repository contains **only** original source code, documentation, and a
+photograph of hardware owned by the contributor. It does **not** contain or
+redistribute:
+
+- Zyxel firmware images, binaries, libraries, or squashfs contents;
+- device calibration data, configuration files, or NVRAM dumps;
+- provider credentials, ACS URLs specific to an account, passwords, hashes,
+  or certificates;
+- any third-party code beyond declared dependencies.
+
+Runtime artifacts used by the tool (passwd files, patched bundles, backups)
+are generated locally on the user's own equipment and are **gitignored**.
+
+## Trademarks
+
+"Zyxel", "EcoNet", "Hyperoptic", "OpenWrt", and all other product, company,
+and service names are trademarks or registered trademarks of their
+respective owners. Use here is nominative and descriptive only.
+
+## Reporting
+
+If you are a rights holder and believe content in this repository
+infringes your rights, open an issue or contact the maintainer before
+filing a formal complaint. Good-faith reports are handled promptly.
+
+Security researchers: see the responsible-disclosure section of
+[LEGAL.md](LEGAL.md).

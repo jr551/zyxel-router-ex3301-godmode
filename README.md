@@ -154,21 +154,24 @@ trade different things.
 - Changing the admin password afterwards is recommended; update your
   password file so the watcher keeps working.
 
-## Legal — read this
+## Legal — read this first
 
-- **Only use this on devices you own or are explicitly authorised to test.**
-  Unauthorised access to computer systems is a criminal offence in most
-  jurisdictions (including, without limitation, the UK Computer Misuse Act
-  1990, the US Computer Fraud and Abuse Act, and EU member-state
-  equivalents). If the router belongs to your ISP, check your contract —
-  modifying ISP-supplied equipment may breach it and may void warranties.
-- This software is provided for **education, research, interoperability,
-  and administration of your own equipment only**. It is not intended to
-  facilitate wrongdoing, bypass lawful access controls on systems you do
-  not own, or interfere with your provider's network.
-- The authors provide this **"as is", without warranty of any kind**, and
-  accept **no liability** for bricked devices, data loss, loss of service,
-  or any legal consequences. You assume all risk. See LICENSE.
-- Do not use this tool to attack, probe, or disrupt ISP infrastructure or
-  any third-party system. Observing traffic to/from your own device is your
-  business; anything beyond that is not covered here.
+**Full notice: [LEGAL.md](LEGAL.md). It is not legal advice — if you're unsure, ask a lawyer.**
+
+- **Ownership first.** Only use this on devices you own or are expressly
+  authorised to administer. Many units of this model are ISP-owned; check
+  your contract. If in doubt, use a lawfully purchased unit (this project was
+  developed on a second-hand eBay unit).
+- **Unauthorised access is a crime** in most jurisdictions (UK Computer
+  Misuse Act 1990, US CFAA, EU equivalents). So is evading billing or
+  bypassing access controls you are not entitled to.
+- **Anti-circumvention laws may apply** (e.g. DMCA §1201, EU Directive
+  2001/29/EC Art. 6). Some countries exempt repair/interoperability; many do
+  not. Checking is your responsibility.
+- **Reversible does not mean consequence-free.** Nothing here writes router
+  flash and a power cycle restores stock — but it may still breach your
+  contract, void a warranty, or breach provider terms.
+- **No warranty, no liability, you indemnify the authors.** See LEGAL.md
+  §§5–7. Bricked devices, lost service, legal costs — your risk.
+- Published for **education, research, interoperability, and administration
+  of equipment you own**. Not for attacking or disrupting anyone's network.

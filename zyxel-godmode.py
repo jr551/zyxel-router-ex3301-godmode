@@ -17,18 +17,20 @@ in tmpfs and the removable USB stick.
 
 Requirements: python3, requests, pycryptodome.
 
-LEGAL - READ FIRST. By running this script you agree:
-  * You will use it ONLY on devices you own or are explicitly authorised
-    to test. Accessing anyone else's router is a crime (e.g. UK Computer
-    Misuse Act 1990, US CFAA, EU equivalents).
-  * Modifying ISP-supplied equipment may breach your broadband contract
-    and may void warranties. Your ISP may detect the changes.
-  * Disabling TR-069/management or altering boot behaviour is at your own
-    risk. A failed flash or bad edit can brick the device; this tool
-    deliberately never writes router flash to keep that risk minimal,
-    but no guarantee is given.
-  * The authors accept NO liability for damage, data loss, bricking,
-    loss of service, or legal consequences. Use at your own risk.
+LEGAL - READ FIRST (full notice in LEGAL.md; not legal advice):
+  * You will use this ONLY on devices you own or are expressly authorised
+    to administer. Accessing anyone else's device/network is a criminal
+    offence in most jurisdictions (UK Computer Misuse Act 1990, US CFAA,
+    EU equivalents). Many units of this model are ISP-owned: check your
+    contract before touching one, or use a purchased unit.
+  * Anti-circumvention law may apply (DMCA 1201, EU 2001/29/EC Art. 6).
+  * Nothing here writes router flash: a power cycle restores stock. That
+    reduces technical risk only - it does not remove contractual or legal
+    risk (breach of terms, void warranty, service termination).
+  * NO WARRANTY. NO LIABILITY. YOU INDEMNIFY THE AUTHORS. Bricked devices,
+    lost service, and legal costs are your risk. See LEGAL.md sections 5-7.
+  * Redistribution includes no proprietary firmware, device secrets,
+    provider credentials, or third-party code.
 """
 import argparse
 import base64
@@ -531,7 +533,11 @@ CONSENT_PHRASE = 'I OWN THIS DEVICE'
 def require_consent(args):
     if args.yes:
         return
-    print(__doc__.split('LEGAL - READ FIRST.', 1)[1].strip())
+    legal = __doc__.split('LEGAL - READ FIRST', 1)[1].strip()
+    print('=' * 70)
+    print(legal)
+    print('=' * 70)
+    print('Full notice: LEGAL.md (not legal advice; consult a lawyer if unsure).')
     try:
         answer = input(f'\nType "{CONSENT_PHRASE}" to continue: ').strip()
     except EOFError:

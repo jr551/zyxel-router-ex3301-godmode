@@ -26,3 +26,18 @@ test. Unauthorised access may be unlawful. Modifying ISP equipment may breach
 your service contract and void warranties. The authors accept no
 responsibility for bricked devices, data loss, loss of service, or legal
 consequences of any kind. You assume all risk.
+
+INDEMNITY: To the maximum extent permitted by law, you agree to indemnify,
+defend, and hold harmless the authors and contributors from any claims,
+damages, losses, costs, and reasonable legal fees arising from your use of
+this software or your breach of the accompanying LEGAL.md notice.
+
+NOT LEGAL ADVICE: LEGAL.md is a plain-language risk notice written by
+non-lawyers and does not constitute legal advice. Consult a qualified lawyer
+in your jurisdiction before use where ownership, contractual terms, or
+anti-circumvention law are uncertain.
+
+TRADEMARKS: Zyxel, EcoNet, Hyperoptic, OpenWrt and all other names are
+trademarks of their respective owners. This project is not affiliated with,
+endorsed by, or sponsored by any of them, and redistributes no proprietary
+firmware, binaries, or provider credentials.
