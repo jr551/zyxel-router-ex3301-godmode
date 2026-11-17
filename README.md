@@ -27,6 +27,35 @@ re-rooting after every reboot.
 - Your router's **admin** password (asked interactively, never stored —
   or pass `--password-file` / `$ZYXEL_ADMIN_PASSWORD` for automation).
 
+## Tested on / firmware
+
+Developed against a second-hand **EX3301-T0 bought on eBay**, stock
+Hyperoptic (ISP) firmware:
+
+| Item | Value |
+|---|---|
+| Firmware | `V5.50(ABVY.5.5)b6_Y0` |
+| Kernel | 3.18.21 (EcoNet EN751627, dual MIPS 1004Kc) |
+| Rootfs | 25 MB LZMA squashfs on SPI NAND, tmpfs `/etc` |
+| Build | OpenWrt-derived (GCC 4.8.1), 14 MTD partitions |
+
+The TR-369 handler and the `app.js` mutation/menu structures are what the
+patch depends on. `stage` verifies both anchors and aborts cleanly if a
+different firmware build doesn't match — it will not write a payload it
+can't verify. Newer ABVY builds (6.x+) are reported to drop the endpoint
+entirely, so this is likely a 5.x-only technique.
+
+## Hardware
+
+![EX3301-T0 with lid off](hardware-ex3301-t0-open.jpg)
+
+Board notes: EcoNet EN751627 SoC under the central heatsink, MT7915D WiFi
+under the shield can (yellow lead = antenna), Winbond W25N01G 128 MB SPI
+NAND as the 8-pin flash chip, 4× GbE LAN + 1× WAN RJ45, 2× FXS phone jacks,
+USB3, and **no DSL jack** on this ETH-WAN variant despite DSL code in the
+firmware. The rainbow Dupont wires are the UART tap used for the serial
+console.
+
 ## Usage
 
 ```bash
@@ -63,8 +92,18 @@ patch. Live `/etc/passwd` is a tmpfs file; flash is never written.
 
 ## Safety notes
 
+- **Ownership first.** Check whether you or your ISP owns the device before
+  running anything. If the router is ISP-supplied (typical for Hyperoptic
+  units), modifying it may breach your contract — see the legal section.
+  This repository was developed and tested on a second-hand unit bought on
+  eBay specifically to avoid that situation.
+- **Everything here is reversible.** No router flash or NVRAM is written:
+  the passwd change, SSH service, firewall rule, and UI patch live in RAM
+  (tmpfs). Unplug the USB stick and reboot and the router returns to stock
+  with your original configuration intact. That's also why a failed attempt
+  can't brick it.
 - A reboot always returns the router to stock except for the USB payload.
-  Unplug the stick + reboot = ISP-pristine box (plus your config).
+  Unplug the stick + reboot = provider-pristine box (plus your config).
 - Every state-changing command (`extract`, `stage`, `restore`) requires
   typing `I OWN THIS DEVICE` unless `--yes` is passed.
 - Back up first: `stage` refuses to run without a valid base passwd, and
