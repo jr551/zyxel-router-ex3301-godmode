@@ -459,6 +459,13 @@ def cmd_restore(args):
     sys.exit('Timed out. Is the stick still inserted with a staged payload?')
 
 
+def router_reachable(host, timeout=4):
+    try:
+        return requests.get(f'{host}/', timeout=timeout, verify=False).status_code < 500
+    except Exception:
+        return False
+
+
 def cmd_watch(args):
     """Run forever: re-root automatically whenever SSH root goes missing."""
     print('[*] watcher started (Ctrl-C to stop)')
@@ -468,9 +475,13 @@ def cmd_watch(args):
         if healthy:
             time.sleep(30)
             continue
-        print(f'[!] root SSH missing ({detail})')
+        # Boot in progress or router off: retry fast, don't burn the cooldown.
+        if not router_reachable(args.host):
+            time.sleep(10)
+            continue
+        print(f'[!] root SSH missing ({detail}); web UI up, restoring')
         if time.time() - last_attempt < 300:
-            time.sleep(30)
+            time.sleep(10)
             continue
         last_attempt = time.time()
         result = subprocess.run(
@@ -481,7 +492,7 @@ def cmd_watch(args):
         )
         print(f'[*] restore {"succeeded" if result.returncode == 0 else "FAILED"}')
         print(result.stdout[-500:] + result.stderr[-500:])
-        time.sleep(30)
+        time.sleep(10)
 
 
 SERVICE_UNIT = """[Unit]
