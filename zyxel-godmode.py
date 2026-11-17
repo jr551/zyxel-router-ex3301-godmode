@@ -2,20 +2,25 @@
 """zyxel-godmode: persistent root + full Web UI for the Zyxel EX3301-T0.
 
 One script, no blobs. It reuses the authenticated TR-369 certificate-copy
-endpoint to plant a logrotate hook on the router; the hook restores a
+endpoint to plant a one-time logrotate hook on the router; the hook gives a
 UID-0 admin, LAN SSH, and an unhidden Web UI from a USB stick payload.
+`persist` then writes only the router's user-data config so the stock
+dropbear starts root SSH at every boot. After that, no USB stick, no Deck
+watcher, and no third-party caller is needed.
 
-Workflow (USB stick moves twice):
-  1. Stick in ROUTER:  ./zyxel-godmode.py extract   (copies live passwd to stick)
-  2. Stick in DECK:    ./zyxel-godmode.py stage /mount/point   (builds payload)
-  3. Stick in ROUTER:  ./zyxel-godmode.py restore   (roots the box, ~5 min)
-  4. Optional:         ./zyxel-godmode.py install   (Deck auto-restore service)
+Workflow:
+  1. Stick in ROUTER:  ./zyxel-godmode.py extract
+  2. Stick in DECK:    ./zyxel-godmode.py stage /mount/point
+  3. Stick in ROUTER:  ./zyxel-godmode.py restore   (one-time root, ~5 min)
+  4. Persist:          ./zyxel-godmode.py persist   (config-only, survives reboot)
+  5. Check:            ./zyxel-godmode.py status
+  6. Optional undo:    ./zyxel-godmode.py depersist
 
-After that, any reboot self-heals: the Deck watcher re-runs the restore.
-Nothing is ever written to router flash/NVRAM; everything volatile lives
-in tmpfs and the removable USB stick.
+`persist` generates a root password, saves it to ~/.zyxel-root (0600), and
+prints where it is. It backs up the config locally, on the router, and to the
+USB stick if one is present. `depersist` restores the backup.
 
-Requirements: python3, requests, pycryptodome.
+Requirements: python3, requests, pycryptodome, openssl.
 
 LEGAL - READ FIRST (full notice in LEGAL.md; not legal advice):
   * You will use this ONLY on devices you own or are expressly authorised
@@ -24,9 +29,13 @@ LEGAL - READ FIRST (full notice in LEGAL.md; not legal advice):
     EU equivalents). Many units of this model are ISP-owned: check your
     contract before touching one, or use a purchased unit.
   * Anti-circumvention law may apply (DMCA 1201, EU 2001/29/EC Art. 6).
-  * Nothing here writes router flash: a power cycle restores stock. That
-    reduces technical risk only - it does not remove contractual or legal
-    risk (breach of terms, void warranty, service termination).
+  * The one-time root path writes no firmware or bootloader data; it uses
+    volatile tmpfs and a removable USB stick. `persist` writes only the
+    user-data configuration partition (/data/zcfg_config.json), never the
+    firmware or bootloader. Backups are saved; `depersist` or a factory
+    reset reverts it. That reduces technical risk only - it does not remove
+    contractual or legal risk (breach of terms, void warranty, service
+    termination).
   * NO WARRANTY. NO LIABILITY. YOU INDEMNIFY THE AUTHORS. Bricked devices,
     lost service, and legal costs are your risk. See LEGAL.md sections 5-7.
   * Redistribution includes no proprietary firmware, device secrets,
@@ -39,10 +48,13 @@ import getpass
 import io
 import json
 import os
+import secrets
+import shlex
 import subprocess
 import sys
+import tempfile
 import time
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 try:
     import requests
@@ -58,6 +70,11 @@ urllib3.disable_warnings()
 AES_KEY = b'\x42' * 32
 IV = b'\x42' * 16
 APP_VERSION_TAG = 'godmode1'
+DEFAULT_ROOT_PW_FILE = os.path.expanduser('~/.zyxel-root')
+BACKUP_DIR = os.path.expanduser('~/.zyxel-godmode')
+ROUTER_CONFIG = '/data/zcfg_config.json'
+ROUTER_CONFIG_BACKUP = '/data/zcfg_config.pre_persist.bak'
+PERSIST_TMP = '/tmp/zcfg_persist.json'
 
 BOOT_SH = """#!/bin/sh
 MNT=""
@@ -323,8 +340,8 @@ def get_password(args):
     return getpass.getpass('Router web-admin password (hidden, never stored): ')
 
 
-def login(args):
-    web = ZyxelWeb(args.host, 'admin', get_password(args))
+def login(args, password=None):
+    web = ZyxelWeb(args.host, 'admin', password or get_password(args))
     with contextlib.redirect_stdout(io.StringIO()):
         ok = web.perform_login()
     if not ok:
@@ -332,7 +349,12 @@ def login(args):
     return web
 
 
-def ssh_uid0(timeout=8):
+def ssh_uid0(timeout=8, password=None):
+    """Legacy check: admin account must be UID 0 (hook payload active)."""
+    if password:
+        ok, out, err = ssh_run('admin', password, '192.168.1.1', 'id', timeout=timeout + 20)
+        detail = (out or err).strip().splitlines()[-1][:120] if (out or err).strip() else ''
+        return ok and 'uid=0' in out, detail or f'exit={0 if ok else 1}'
     env = dict(os.environ)
     askpass = os.environ.get('SSH_ASKPASS', '/tmp/exfw/.askpass')
     env.update({'SSH_ASKPASS': askpass, 'SSH_ASKPASS_REQUIRE': 'force', 'DISPLAY': ':0'})
@@ -353,6 +375,124 @@ def ssh_uid0(timeout=8):
     return ok, result.stdout.strip().splitlines()[-1][:120] if result.stdout else f'exit={result.returncode}'
 
 
+def ssh_host(args):
+    return urlparse(args.host).hostname or '192.168.1.1'
+
+
+def read_password_file(path):
+    bare = None
+    with open(path, 'r', encoding='utf-8') as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith('#'):
+                continue
+            if line.startswith('password='):
+                return line.split('=', 1)[1].strip()
+            if '=' not in line and bare is None:
+                bare = line
+    if bare is not None:
+        return bare
+    raise ValueError(f'no password in {path}')
+
+
+def root_password(args, generate=False, rotate=False):
+    """Resolve the root password, or generate and save a new one.
+
+    Order: --root-password-file, $ZYXEL_ROOT_PASSWORD, ~/.zyxel-root.
+    rotate=True ignores existing values and writes a fresh one to
+    ~/.zyxel-root (used by `persist --rotate-root-password`).
+    """
+    if not rotate:
+        if args.root_password_file:
+            return read_password_file(args.root_password_file), args.root_password_file, False
+        env = os.environ.get('ZYXEL_ROOT_PASSWORD')
+        if env:
+            return env, '$ZYXEL_ROOT_PASSWORD', False
+        if os.path.exists(DEFAULT_ROOT_PW_FILE):
+            return read_password_file(DEFAULT_ROOT_PW_FILE), DEFAULT_ROOT_PW_FILE, False
+    if not generate:
+        return None, None, False
+    pw = secrets.token_urlsafe(12)
+    write_private(DEFAULT_ROOT_PW_FILE, f'password={pw}\n')
+    return pw, DEFAULT_ROOT_PW_FILE, True
+
+
+def write_private(path, text):
+    directory = os.path.dirname(path)
+    if directory:
+        os.makedirs(directory, mode=0o700, exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+        f.write(text)
+
+
+def ssh_run(user, password, host, command, input_data=None, timeout=60):
+    """Run one command over SSH with password auth. Returns (ok, out, err)."""
+    fd, askpass = tempfile.mkstemp(prefix='zyxel-askpass-', suffix='.sh')
+    try:
+        os.fchmod(fd, 0o700)
+        with os.fdopen(fd, 'w', encoding='ascii') as f:
+            f.write('#!/bin/sh\nprintf "%s\\n" ' + shlex.quote(password) + '\n')
+        env = dict(os.environ)
+        env.update({
+            'SSH_ASKPASS': askpass,
+            'SSH_ASKPASS_REQUIRE': 'force',
+            'DISPLAY': ':0',
+        })
+        cmd = [
+            'setsid', '-w', 'ssh',
+            '-o', 'StrictHostKeyChecking=no',
+            '-o', 'UserKnownHostsFile=/dev/null',
+            '-o', 'PreferredAuthentications=password',
+            '-o', 'PubkeyAuthentication=no',
+            '-o', 'NumberOfPasswordPrompts=1',
+            '-o', 'ConnectTimeout=8',
+            f'{user}@{host}', command,
+        ]
+        result = subprocess.run(cmd, env=env, input=input_data,
+                                capture_output=True, text=True, timeout=timeout)
+        return result.returncode == 0, result.stdout or '', result.stderr or ''
+    except subprocess.TimeoutExpired:
+        return False, '', 'timeout'
+    except Exception as exc:
+        return False, '', f'{type(exc).__name__}: {exc}'
+    finally:
+        try:
+            os.unlink(askpass)
+        except OSError:
+            pass
+
+
+def ssh_root(args, command, password, input_data=None, timeout=60):
+    return ssh_run('root', password, ssh_host(args), command, input_data, timeout)
+
+
+def ssh_admin(args, command, password, input_data=None, timeout=60):
+    return ssh_run('admin', password, ssh_host(args), command, input_data, timeout)
+
+
+def find_account(cfg, username):
+    for group in cfg.get('X_ZYXEL_LoginCfg', {}).get('LogGp', []):
+        for account in group.get('Account', []):
+            if account.get('Username') == username:
+                return account
+    return None
+
+
+def find_ssh_service(cfg):
+    for service in cfg.get('X_ZYXEL_RemoteManagement', {}).get('Service', []):
+        if service.get('Name') == 'SSH':
+            return service
+    return None
+
+
+def shadow_last_change(old):
+    for part in old.split(':')[1:]:
+        if part.isdigit():
+            return part
+    return '19716'
+
+
 def cmd_status(args):
     print(f'[*] router: {args.host}')
     try:
@@ -365,8 +505,19 @@ def cmd_status(args):
     info = json.loads(web._decrypt_response(response.json()))
     volumes = [i.get('Volume') for o in info.get('Object', []) for i in o.get('Usb Info', [])]
     print(f'[*] USB volumes: {volumes}')
-    healthy, detail = ssh_uid0()
-    print(f'[*] SSH root: {"YES" if healthy else "NO"} ({detail})')
+    try:
+        root_pw, root_src, _ = root_password(args, generate=False)
+    except Exception as exc:
+        print(f'[-] could not read root password: {exc}')
+        root_pw = None
+    if root_pw:
+        ok, out, err = ssh_root(args, 'id', root_pw)
+        detail = (out or err).strip().splitlines()[-1][:120] if (out or err).strip() else ''
+        print(f'[*] persistent root SSH: {"YES" if ok and "uid=0" in out else "NO"} ({detail})')
+    else:
+        print('[*] persistent root SSH: unknown (no ~/.zyxel-root; use --root-password-file)')
+    legacy, legacy_detail = ssh_uid0()
+    print(f'[*] legacy hook admin UID0: {"YES" if legacy else "NO"} ({legacy_detail})')
     try:
         served = requests.get(f'{args.host}/static/js/app.js', timeout=30, verify=False).text
         patched = 'updateMenuList",function(L)' in served or 'ROOT_UI_PATCH' in served
@@ -431,7 +582,8 @@ def cmd_stage(args):
 
 def cmd_restore(args):
     """Stick must be IN THE ROUTER. Installs the hook and waits for root."""
-    web = login(args)
+    admin_pw = get_password(args)
+    web = login(args, admin_pw)
     headers = {'CSRFToken': web.sessionkey}
     response = web.r.get(f'{args.host}/cgi-bin/DAL?oid=usb_info', headers=headers, timeout=15)
     info = json.loads(web._decrypt_response(response.json()))
@@ -450,13 +602,231 @@ def cmd_restore(args):
     print('[*] hook installed; waiting up to 6 minutes for the logrotate job...')
     deadline = time.time() + 360
     while time.time() < deadline:
-        healthy, detail = ssh_uid0()
+        healthy, detail = ssh_uid0(password=admin_pw)
         if healthy:
             print(f'[*] ROOT RESTORED: {detail}')
             return 0
         time.sleep(15)
         print('    still waiting...')
     sys.exit('Timed out. Is the stick still inserted with a staged payload?')
+
+
+def cmd_persist(args):
+    """Write config-only persistent root: clean root shadow + LAN-only SSH."""
+    try:
+        old_root_pw, old_root_src, _ = root_password(args, generate=False)
+    except Exception as exc:
+        sys.exit(f'Could not read the root password: {exc}')
+    transport = None
+    if old_root_pw:
+        ok, out, err = ssh_root(args, 'id', old_root_pw)
+        if ok and 'uid=0' in out:
+            transport = ('root', old_root_pw)
+            print(f'[*] privileged shell: root SSH ({old_root_src})')
+    if transport is None:
+        try:
+            admin_pw = get_password(args)
+        except Exception as exc:
+            sys.exit(f'Could not read the admin password: {exc}')
+        ok, out, err = ssh_admin(args, 'id', admin_pw)
+        if ok and 'uid=0' in out:
+            transport = ('admin', admin_pw)
+            print('[*] privileged shell: admin UID 0 (one-time hook)')
+        else:
+            print(f'[-] admin SSH check failed: {(err or out).strip()[:160]}')
+    if transport is None:
+        sys.exit('Need a privileged shell: run `restore` first (one-time USB hook), '
+                 'or pass --root-password-file with the current root password.')
+    user, password = transport
+
+    ok, config_text, err = ssh_run(user, password, ssh_host(args), f'cat {ROUTER_CONFIG}')
+    if not ok or not config_text.strip():
+        sys.exit(f'Could not read {ROUTER_CONFIG}: {(err or config_text).strip()[:200]}')
+    try:
+        cfg = json.loads(config_text)
+    except json.JSONDecodeError as exc:
+        sys.exit(f'{ROUTER_CONFIG} is not valid JSON: {exc}')
+
+    root_acct = find_account(cfg, 'root')
+    ssh_svc = find_ssh_service(cfg)
+    if root_acct is None:
+        sys.exit('Root account not found in the login config; firmware differs.')
+    if ssh_svc is None:
+        sys.exit('Remote-management SSH service not found; firmware differs.')
+
+    old_shadow = root_acct.get('shadow', '')
+    lastchg = shadow_last_change(old_shadow)
+    print('[*] planned persistent changes:')
+    print(f'    root shadow: single SHA-512 hash, lastchange={lastchg}')
+    print('    SSH service: Enable=true Mode=LAN_ONLY RestartDeamon=true password-auth=true')
+    if args.dry_run:
+        print('[*] dry run: nothing written.')
+        return 0
+
+    if args.rotate_root_password or old_root_pw is None:
+        new_root_pw, new_root_src, _ = root_password(args, generate=True, rotate=True)
+        if args.rotate_root_password and args.root_password_file:
+            print('[*] note: --rotate-root-password writes the new password to '
+                  '~/.zyxel-root, not to the file passed with --root-password-file.')
+    else:
+        new_root_pw, new_root_src = old_root_pw, old_root_src
+
+    stamp = time.strftime('%Y%m%d-%H%M%S')
+    local_backup = os.path.join(BACKUP_DIR, f'zcfg_config.{stamp}.json')
+    write_private(local_backup, config_text)
+    print(f'[*] local backup: {local_backup}')
+
+    usb_backup = None
+    ok, out, err = ssh_run(
+        user, password, ssh_host(args),
+        'for d in /mnt/usb*; do if [ -d "$d" ]; then '
+        'cp /data/zcfg_config.json "$d/zcfg_config.pre_persist.bak" && echo "$d"; break; fi; done')
+    if ok and out.strip():
+        usb_backup = out.strip().splitlines()[-1] + '/zcfg_config.pre_persist.bak'
+        print(f'[*] USB backup: {usb_backup}')
+    else:
+        print('[*] USB backup: skipped (no mounted USB volume)')
+
+    try:
+        hashed = subprocess.run(
+            ['openssl', 'passwd', '-6', '-salt', secrets.token_hex(8), new_root_pw],
+            capture_output=True, text=True, check=True).stdout.strip()
+    except FileNotFoundError:
+        sys.exit('openssl not found; install openssl to generate the SHA-512 hash.')
+    except subprocess.CalledProcessError as exc:
+        sys.exit(f'openssl passwd failed: {exc.stderr.strip()}')
+    if not hashed.startswith('$6$'):
+        sys.exit(f'openssl returned an unexpected hash: {hashed[:40]!r}')
+
+    root_acct['Enabled'] = True
+    root_acct['shadow'] = f'root:{hashed}:{lastchg}:0:99999:7:::'
+    ssh_svc.update({
+        'Enable': True,
+        'Port': ssh_svc.get('Port', 22),
+        'Mode': 'LAN_ONLY',
+        'OldMode': 'LAN_ONLY',
+        'RestartDeamon': True,
+        'DisableSshPasswordLogin': False,
+    })
+
+    payload = json.dumps(cfg, ensure_ascii=False)
+    ok, out, err = ssh_run(user, password, ssh_host(args), f'cat > {PERSIST_TMP}',
+                           input_data=payload)
+    if not ok:
+        sys.exit(f'Could not upload the new config: {(err or out).strip()[:200]}')
+
+    apply_cmd = (
+        'set -e; '
+        f'if [ ! -f {ROUTER_CONFIG_BACKUP} ]; then cp {ROUTER_CONFIG} {ROUTER_CONFIG_BACKUP}; fi; '
+        'killall -9 zcmd 2>/dev/null || true; sleep 1; '
+        f'cp {PERSIST_TMP} {ROUTER_CONFIG}; '
+        f'chmod 700 {ROUTER_CONFIG}; chown root:root {ROUTER_CONFIG}; sync'
+    )
+    if not args.no_reboot:
+        apply_cmd += '; (sleep 2; reboot) >/dev/null 2>&1 & echo rebooting'
+    ok, out, err = ssh_run(user, password, ssh_host(args), apply_cmd, timeout=60)
+    if not ok:
+        sys.exit(f'Could not apply the config: {(err or out).strip()[:200]}')
+    if args.no_reboot:
+        print('[*] config written. Reboot the router to apply; then use the new root password.')
+        return 0
+
+    print(f'[*] rebooting; waiting up to {args.timeout}s for persistent root...')
+    deadline = time.time() + args.timeout
+    last_detail = ''
+    while time.time() < deadline:
+        ok, out, err = ssh_root(args, 'id', new_root_pw, timeout=12)
+        if ok and 'uid=0' in out:
+            print('[*] root SSH is back.')
+            break
+        last_detail = (err or out).strip().splitlines()[-1][:120] if (err or out).strip() else ''
+        time.sleep(10)
+        print('    still waiting...')
+    else:
+        sys.exit(f'Timed out after {args.timeout}s. Backups: {local_backup}, '
+                 f'{ROUTER_CONFIG_BACKUP}' + (f', {usb_backup}' if usb_backup else '') +
+                 f'. Last error: {last_detail}')
+
+    checks = {}
+    ok, out, _ = ssh_root(args, 'id -u', new_root_pw)
+    checks['uid'] = out.strip() if ok else ''
+    ok, out, _ = ssh_root(args, "grep '^admin:' /etc/passwd", new_root_pw)
+    checks['admin'] = out.strip() if ok else ''
+    ok, out, _ = ssh_root(args, 'test -e /tmp/root_boot.log && echo PRESENT || echo ABSENT', new_root_pw)
+    checks['hook'] = out.strip() if ok else ''
+    ok, out, _ = ssh_root(args, "grep -c 'payload/boot.sh' /var/logrotate.d/sys_logrotate.conf 2>/dev/null || true", new_root_pw)
+    checks['logrotate'] = out.strip() if ok else ''
+    ok, out, _ = ssh_root(args, "ps | grep '[d]ropbear' | head -1", new_root_pw)
+    checks['dropbear'] = out.strip() if ok else ''
+    ok, out, _ = ssh_root(args, "grep '^root:' /etc/shadow", new_root_pw)
+    checks['shadow'] = out.strip() if ok else ''
+    ok, cfg_text, _ = ssh_root(args, f'cat {ROUTER_CONFIG}', new_root_pw)
+    cfg_ok = False
+    cfg_shadow_ok = False
+    try:
+        cfg2 = json.loads(cfg_text)
+        svc2 = find_ssh_service(cfg2)
+        acct2 = find_account(cfg2, 'root')
+        cfg_ok = bool(svc2 and svc2.get('Enable') is True and svc2.get('Mode') == 'LAN_ONLY')
+        cfg_shadow_ok = bool(acct2 and str(acct2.get('shadow', '')).count('$6$') == 1)
+    except Exception:
+        pass
+
+    results = [
+        ('root uid 0', checks['uid'] == '0'),
+        ('admin account not hook UID 0', 'admin:x:0:0:' not in checks['admin']),
+        ('no USB hook log', checks['hook'] == 'ABSENT'),
+        ('stock logrotate config', checks['logrotate'].strip() in ('0', '')),
+        ('stock dropbear on 22', 'dropbear -p 22' in checks['dropbear']
+         and '192.168.1.1:22' not in checks['dropbear']),
+        ('clean root shadow', checks['shadow'].count('$6$') == 1),
+        ('config SSH Mode=LAN_ONLY', cfg_ok),
+        ('config root shadow clean', cfg_shadow_ok),
+    ]
+    print('[*] verification:')
+    for name, passed in results:
+        print(f'    [{"OK" if passed else "FAIL"}] {name}')
+    print(f'[*] persistent root: ssh root@{ssh_host(args)}')
+    print(f'[*] root password: {new_root_src}')
+    print(f'[*] backups: {local_backup}, {ROUTER_CONFIG_BACKUP}'
+          + (f', {usb_backup}' if usb_backup else ''))
+    return 0 if all(passed for _, passed in results) else 1
+
+
+def cmd_depersist(args):
+    """Restore the pre-persist config and reboot; removes persistent root."""
+    try:
+        root_pw, root_src, _ = root_password(args, generate=False)
+    except Exception as exc:
+        sys.exit(f'Could not read the root password: {exc}')
+    if not root_pw:
+        sys.exit('Need the current root password: pass --root-password-file '
+                 'or create ~/.zyxel-root.')
+    ok, out, err = ssh_root(args, f'test -f {ROUTER_CONFIG_BACKUP} && echo yes', root_pw)
+    if not ok or 'yes' not in out:
+        sys.exit(f'No {ROUTER_CONFIG_BACKUP} on the router; cannot revert automatically.')
+    revert_cmd = (
+        f'cp {ROUTER_CONFIG_BACKUP} {ROUTER_CONFIG}; '
+        f'chmod 700 {ROUTER_CONFIG}; chown root:root {ROUTER_CONFIG}; sync; '
+        '(sleep 2; reboot) >/dev/null 2>&1 & echo rebooting'
+    )
+    ok, out, err = ssh_root(args, revert_cmd, root_pw, timeout=30)
+    if not ok:
+        sys.exit(f'Could not revert: {(err or out).strip()[:200]}')
+    print('[*] reverted; waiting for the web UI...')
+    time.sleep(20)
+    deadline = time.time() + 300
+    while time.time() < deadline:
+        try:
+            response = requests.get(args.host, timeout=4, verify=False)
+            if response.status_code < 500:
+                print('[*] web UI is up. Persistent root removed; run `restore` if you need root again.')
+                return 0
+        except Exception:
+            pass
+        time.sleep(10)
+    print('[-] web UI did not come back; power-cycle and use the USB recovery payload if needed.')
+    return 1
 
 
 def router_reachable(host, timeout=4):
@@ -566,23 +936,39 @@ def main():
     parser.add_argument('--password-file',
                         help='file with "password=..." (mode 0600) or a bare password; '
                              'else $ZYXEL_ADMIN_PASSWORD, else prompt')
+    parser.add_argument('--root-password-file',
+                        help='file with the current root password (mode 0600); '
+                             'else $ZYXEL_ROOT_PASSWORD or ~/.zyxel-root')
     sub = parser.add_subparsers(dest='command', required=True)
-    sub.add_parser('status', help='show router/USB/SSH/UI state (read-only + login)')
+    sub.add_parser('status', help='show router/USB/SSH/UI/persistent-root state')
     sub.add_parser('extract', help='copy live passwd to USB (stick in ROUTER)')
     stage = sub.add_parser('stage', help='build payload on USB (stick on THIS machine)')
     stage.add_argument('mount', help='USB mountpoint, e.g. /run/media/$USER/ROUTERSTICK')
     sub.add_parser('restore', help='install hook and wait for root (stick in ROUTER)')
-    sub.add_parser('watch', help='daemon: auto-restore whenever root is missing')
-    sub.add_parser('install', help='install the watcher as a systemd user service')
-    sub.add_parser('uninstall', help='remove the watcher service')
+    persist = sub.add_parser(
+        'persist',
+        help='write config-only persistent root (no USB/watcher after this)')
+    persist.add_argument('--dry-run', action='store_true',
+                         help='read and show planned config changes only')
+    persist.add_argument('--no-reboot', action='store_true',
+                         help='write the config but do not reboot')
+    persist.add_argument('--rotate-root-password', action='store_true',
+                         help='generate a new root password in ~/.zyxel-root')
+    persist.add_argument('--timeout', type=int, default=300,
+                         help='seconds to wait for root SSH after reboot (default 300)')
+    sub.add_parser('depersist', help='restore the pre-persist config and reboot')
+    sub.add_parser('watch', help='legacy: daemon that auto-restores the USB hook')
+    sub.add_parser('install', help='legacy: install the watcher as a systemd user service')
+    sub.add_parser('uninstall', help='remove the legacy watcher service')
     args = parser.parse_args()
     if not args.host.startswith('http'):
         args.host = 'http://' + args.host
-    if args.command in ('extract', 'stage', 'restore'):
+    if args.command in ('extract', 'stage', 'restore', 'persist', 'depersist'):
         require_consent(args)
     return {'status': cmd_status, 'extract': cmd_extract, 'stage': cmd_stage,
-            'restore': cmd_restore, 'watch': cmd_watch, 'install': cmd_install,
-            'uninstall': cmd_uninstall}[args.command](args)
+            'restore': cmd_restore, 'persist': cmd_persist,
+            'depersist': cmd_depersist, 'watch': cmd_watch,
+            'install': cmd_install, 'uninstall': cmd_uninstall}[args.command](args)
 
 
 if __name__ == '__main__':

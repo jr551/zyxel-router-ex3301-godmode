@@ -50,10 +50,14 @@ contract, early-termination fees, recovery charges, suspension of service,
 and in some jurisdictions criminal liability. You accept those consequences
 entirely.
 
-**Note on reversibility:** this tool deliberately never writes router flash
-or NVRAM. Changes live in volatile memory and on a removable USB stick, so a
-power cycle restores the device to its stock configuration. That reduces
-technical risk; it does **not** reduce legal or contractual risk.
+**Note on reversibility:** the one-time root path writes no firmware or
+bootloader data; it uses volatile tmpfs and a removable USB stick. The
+optional `persist` command writes only the user-data configuration file
+`/data/zcfg_config.json` on the persistent data partition, never the
+firmware, bootloader, or NVRAM. It keeps backups (locally, on the router,
+and on the USB stick if present) and can be reverted with `depersist` or a
+factory reset. That reduces technical risk; it does **not** reduce legal or
+contractual risk.
 
 ## 4. Anti-circumvention and firmware law
 
@@ -101,6 +105,8 @@ You acknowledge that:
 - modifying networking equipment can render it inoperable;
 - recovery may require physical access, a UART adapter, or a flash
   programmer;
+- persistent changes written to the configuration partition may require a
+  factory reset, a config restore, or physical recovery to remove;
 - your service provider may detect changes and may react by pushing
   configuration, resetting the device, restricting service, or terminating
   your contract;
